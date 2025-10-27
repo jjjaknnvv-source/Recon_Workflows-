@@ -1,4 +1,4 @@
-name: Subdomain & Vulnerability Robinhood
+name: Subdomain & Vulnerability Robinhood (extended)
 
 on:
   workflow_dispatch:
@@ -6,35 +6,59 @@ on:
       domain:
         description: 'Domain to scan'
         required: true
-        default: 'robinhood.com'
+        default: 'vueling.com'
   schedule:
     - cron: '0 6 * * 1'  # Every Monday at 6 AM UTC
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    env:
+      DISCORD_WEBHOOK_NAME: DISCORD_WEBHOOK_Robinhood
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Setup system deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq zip wget curl unzip python3 python3-pip pcregrep
+          # ensure pip is latest
+          python3 -m pip install --upgrade pip
 
       - name: Setup Go
         uses: actions/setup-go@v4
         with:
           go-version: '1.21'
 
-      - name: Install Tools
+      - name: Install Tools (subfinder, nuclei, httpx, waybackurls, gau, hakrawler, ffuf, gitleaks)
         run: |
+          # go tools
           go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
           go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
-          sudo apt-get update && sudo apt-get install -y jq
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/tomnomnom/waybackurls@latest
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          go install -v github.com/hakluke/hakrawler@latest
+          go install -v github.com/ffuf/ffuf@latest
+          # gitleaks (go)
+          go install -v github.com/zricethezav/gitleaks/v8@latest
+          # add go bin to PATH
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+          # Python-based tools: SecretFinder, LinkFinder, truffleHog (python package)
+          python3 -m pip install git+https://github.com/m4ll0k/SecretFinder.git || true
+          python3 -m pip install git+https://github.com/GerbenJavado/LinkFinder.git || true
+          python3 -m pip install truffleHog==4.26.2 || python3 -m pip install trufflehog || true
+          # (the truffleHog package name/version might vary; we attempt common install)
 
       - name: Validate Secrets
         run: |
-          if [ -z "${{ secrets.DISCORD_WEBHOOK }}" ]; then
-            echo "::error::DISCORD_WEBHOOK secret is not set"
+          if [ -z "${{ secrets[env.DISCORD_WEBHOOK_NAME] }}" ]; then
+            echo "::error::${{ env.DISCORD_WEBHOOK_NAME }} secret is not set"
             exit 1
           fi
-          echo "DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK_Robinhood }}" >> $GITHUB_ENV
+          echo "DISCORD_WEBHOOK=${{ secrets[DISCORD_WEBHOOK_NAME] }}" >> $GITHUB_ENV
 
       - name: Set Domain
         id: set_domain
@@ -42,77 +66,202 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "DOMAIN=${{ github.event.inputs.domain }}" >> $GITHUB_ENV
           else
-            echo "DOMAIN=example.com" >> $GITHUB_ENV
+            echo "DOMAIN=robinhood.com" >> $GITHUB_ENV
           fi
 
       - name: Notify Start
         run: |
           curl -X POST -H "Content-Type: application/json" -d '{
-            "content": "🔍 **Scan Started**\n**Domain:** ${{ env.DOMAIN }}\n**Trigger:** ${{ github.event_name }}\n**Tools:** Subfinder + Nuclei"
+            "content": "🔍 **Extended Scan Started**\n**Domain:** '"${{ env.DOMAIN }}"' \n**Trigger:** '"${{ github.event_name }}"' \n**Tools:** Subfinder, Nuclei, ffuf, wayback/gau, SecretFinder, LinkFinder, truffleHog, gitleaks"
           }' "${{ env.DISCORD_WEBHOOK }}"
 
       - name: Run Subfinder
         run: |
-          subfinder -d ${{ env.DOMAIN }} -silent -o subdomains.txt
+          subfinder -d ${{ env.DOMAIN }} -silent -o subdomains.txt || true
+          if [ ! -s subdomains.txt ]; then
+            echo "${{ env.DOMAIN }}" > subdomains.txt
+          fi
           echo "SUBDOMAINS_FOUND=$(wc -l < subdomains.txt)" >> $GITHUB_ENV
 
-      - name: Notify Subfinder Results
+      - name: Gather JS via wayback + gau + hakrawler
         run: |
-          # Read subdomains content
-          SUBDOMAINS_CONTENT=$(cat subdomains.txt)
-          
-          # Create message
-          MESSAGE="✅ **Subfinder Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subdomains Found:** ${{ env.SUBDOMAINS_FOUND }}\n\n\`\`\`\n$SUBDOMAINS_CONTENT\n\`\`\`"
-          
-          # Truncate if too long
-          if [ ${#MESSAGE} -gt 1900 ]; then
-            TRUNCATED=$(echo "$SUBDOMAINS_CONTENT" | head -c 1800)
-            MESSAGE="✅ **Subfinder Complete**\n**Domain:** ${{ env.DOMAIN }}\n**Subdomains Found:** ${{ env.SUBDOMAINS_FOUND }}\n\n\`\`\`\n$TRUNCATED... [truncated]\n\`\`\`"
+          mkdir -p collectors
+          > collectors/combined_raw.txt
+          while IFS= read -r host; do
+            echo "=== COLLECT: $host ===" >> collectors/collector.log
+            echo "$host" | waybackurls >> collectors/wayback.txt || true
+            echo "$host" | gau >> collectors/gau.txt || true
+            echo "$host" | hakrawler -url "https://$host" -plain -depth 2 >> collectors/hakrawler.txt || true
+            # sitemap attempt
+            for s in "https://$host/sitemap.xml" "http://$host/sitemap.xml"; do
+              curl -s "$s" >> collectors/sitemaps_raw.txt || true
+            done
+          done < subdomains.txt
+          cat collectors/*.txt >> collectors/combined_raw.txt || true
+
+          # extract .js URLs from wayback/gau/hakrawler/sitemaps
+          cat collectors/combined_raw.txt | grep -Eo 'https?://[^\"'\'' <>()]+' | grep -i '\.js(\?|$)' | sort -u > js_urls.txt || true
+          # attempt to parse sitemap xml for urls ending with .js
+          if [ -s collectors/sitemaps_raw.txt ]; then
+            grep -Eo 'https?://[^<]+' collectors/sitemaps_raw.txt | grep -i '\.js' | sort -u >> js_urls.txt || true
           fi
-          
-          # Send to Discord
-          curl -X POST -H "Content-Type: application/json" \
-            -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
-            "${{ env.DISCORD_WEBHOOK }}"
+          sort -u js_urls.txt -o js_urls.txt || true
+          echo "JS_URLS_COUNT=$(wc -l < js_urls.txt || true)" >> $GITHUB_ENV
+          head -n 50 js_urls.txt || true
+
+      - name: Bruteforce common JS paths with ffuf (aggressive)
+        run: |
+          mkdir -p ffuf_out
+          # small wordlist inline - better to reference a repo wordlist in real use
+          cat > ffuf_wordlist.txt <<'WL'
+app.js
+main.js
+bundle.js
+vendor.js
+runtime.js
+index.js
+static/js/app.js
+static/js/main.js
+assets/js/app.js
+build/static/js/app.js
+WL
+          # run ffuf for each host
+          while IFS= read -r host; do
+            target="https://$host/FUZZ"
+            ffuf -w ffuf_wordlist.txt -u $target -mc 200 -t 40 -o ffuf_out/$host.json -of json || true
+            # extract urls from ffuf json
+            jq -r '.results[].url' ffuf_out/$host.json 2>/dev/null | grep -i '\.js' >> js_urls.txt || true
+          done < subdomains.txt || true
+          sort -u js_urls.txt -o js_urls.txt || true
+          echo "JS_URLS_COUNT_POST_FFUf=$(wc -l < js_urls.txt || true)" >> $GITHUB_ENV
+          head -n 100 js_urls.txt || true
+
+      - name: Download JS files (updated)
+        run: |
+          mkdir -p js_files
+          if [ ! -s js_urls.txt ]; then
+            echo "No js URLs found, will try to probe common paths per host"
+            while IFS= read -r host; do
+              for p in "/static/js" "/assets" "/static" "/build/static/js" "/js" "/scripts"; do
+                # try listing (not guaranteed)
+                curl -s "https://$host$p/" | grep -Eo 'href="([^"]+\.js)"' | sed -E 's/href=//' | tr -d '"' | while read -r u; do
+                  if [[ "$u" =~ ^http ]]; then echo "$u" >> js_urls.txt; else echo "https://$host$u" >> js_urls.txt; fi
+                done || true
+              done
+            done < subdomains.txt
+            sort -u js_urls.txt -o js_urls.txt || true
+          fi
+
+          # download all js URLs
+          while IFS= read -r url; do
+            fname="js_files/$(echo -n "$url" | sha1sum | awk '{print $1}').js"
+            if [ -f "$fname" ]; then
+              continue
+            fi
+            wget -q -T 15 -O "$fname" "$url" || echo "FAILED_DOWNLOAD $url" >> js_files/download-failed.log
+            sleep 0.5
+          done < js_urls.txt || true
+          echo "JS_FILES_COUNT=$(ls -1 js_files/*.js 2>/dev/null | wc -l || true)" >> $GITHUB_ENV
+          ls -lah js_files | sed -n '1,200p' || true
+
+      - name: Static analysis: SecretFinder + LinkFinder on JS files
+        run: |
+          mkdir -p findings
+          > findings/secretfinder_raw.txt
+          > findings/linkfinder_raw.txt
+          # run SecretFinder (python) against each js file
+          for f in js_files/*.js; do
+            if [ ! -f "$f" ]; then continue; fi
+            # SecretFinder from piped package: try running as module
+            python3 -m SecretFinder -i "$f" -o cli >> findings/secretfinder_raw.txt 2>/dev/null || true
+            # LinkFinder
+            python3 -m linkfinder -i "$f" -o cli >> findings/linkfinder_raw.txt 2>/dev/null || true
+          done
+          sort -u findings/secretfinder_raw.txt > findings/secretfinder.txt || true
+          sort -u findings/linkfinder_raw.txt > findings/linkfinder.txt || true
+          echo "SECRETFINDER=$(wc -l < findings/secretfinder.txt || true)" >> $GITHUB_ENV
+          echo "LINKFINDER=$(wc -l < findings/linkfinder.txt || true)" >> $GITHUB_ENV
+          ls -lah findings || true
+
+      - name: Deep secrets scan: truffleHog + gitleaks against JS directory
+        run: |
+          mkdir -p findings/deep
+          # truffleHog (python) - attempt to scan files for high-entropy strings
+          # If the installed truffleHog exposes `trufflehog` CLI:
+          if command -v trufflehog >/dev/null 2>&1; then
+            trufflehog filesystem --json js_files > findings/deep/trufflehog_files.json || true
+          else
+            echo "trufflehog CLI not found; skipping trufflehog run" > findings/deep/trufflehog_skip.txt
+          fi
+
+          # gitleaks: run against the js_files directory using filesystem mode (if supported)
+          if command -v gitleaks >/dev/null 2>&1; then
+            # gitleaks v8 supports filesystem scanning via 'gitleaks detect --source'
+            gitleaks detect --source js_files --report-format json --report-path findings/deep/gitleaks_files.json || true
+          else
+            echo "gitleaks CLI not found; skipping gitleaks run" > findings/deep/gitleaks_skip.txt
+          fi
+
+          ls -lah findings/deep || true
 
       - name: Run Nuclei
         run: |
-          nuclei -l subdomains.txt -severity critical,high,medium -silent -o nuclei-results.txt
-          echo "VULNS_FOUND=$(wc -l < nuclei-results.txt)" >> $GITHUB_ENV
+          nuclei -l subdomains.txt -severity critical,high,medium -silent -o nuclei-results.txt || true
+          echo "VULNS_FOUND=$(wc -l < nuclei-results.txt || true)" >> $GITHUB_ENV
 
       - name: Notify Nuclei Summary
         run: |
-          if [ ${{ env.VULNS_FOUND }} -gt 0 ]; then
+          if [ "${{ env.VULNS_FOUND }}" -gt 0 ]; then
             curl -X POST -H "Content-Type: application/json" -d '{
-              "content": "🚨 **Vulnerabilities Found!**\n**Domain:** ${{ env.DOMAIN }}\n**Count:** ${{ env.VULNS_FOUND }}\n\nSending each vulnerability as a separate message..."
+              "content": "🚨 **Vulnerabilities Found!**\n**Domain:** '"${{ env.DOMAIN }}"'\n**Count:** '"${{ env.VULNS_FOUND }}"'\n\nSending each vulnerability as a separate message..."
             }' "${{ env.DISCORD_WEBHOOK }}"
           else
             curl -X POST -H "Content-Type: application/json" -d '{
-              "content": "✅ **Nuclei Complete**\n**Domain:** ${{ env.DOMAIN }}\nNo critical/high/medium vulnerabilities found"
+              "content": "✅ **Nuclei Complete**\n**Domain:** '"${{ env.DOMAIN }}"'\nNo critical/high/medium vulnerabilities found"
             }' "${{ env.DISCORD_WEBHOOK }}"
           fi
 
       - name: Send Individual Vulnerabilities
         if: env.VULNS_FOUND > 0
         run: |
-          # Read each line and send as separate message
           while IFS= read -r vuln; do
-            # Create message for this vulnerability
             MESSAGE="🚨 **Vulnerability Found**\n**Domain:** ${{ env.DOMAIN }}\n\`\`\`\n$vuln\n\`\`\`"
-            
-            # Send to Discord
             curl -X POST -H "Content-Type: application/json" \
               -d "{\"content\": $(echo "$MESSAGE" | jq -Rs .)}" \
               "${{ env.DISCORD_WEBHOOK }}"
-              
-            # Small delay to avoid rate limiting
             sleep 1
           done < nuclei-results.txt
+
+      - name: Package All Findings
+        run: |
+          mkdir -p artifacts
+          timestamp=$(date -u +"%Y%m%dT%H%M%SZ")
+          zipname="extended-scan-${{ env.DOMAIN }}-${timestamp}.zip"
+          zip -r artifacts/$zipname subdomains.txt js_urls.txt js_files findings nuclei-results.txt collectors ffuf_out || true
+          echo "ZIP_FILE=artifacts/$zipname" >> $GITHUB_ENV
+          ls -lah artifacts || true
+
+      - name: Send ZIP to Discord
+        run: |
+          if [ -f "${{ env.ZIP_FILE }}" ]; then
+            curl -s -F "payload_json={\"content\":\"📦 Extended scan results for ${{ env.DOMAIN }}\\nSubdomains: ${{ env.SUBDOMAINS_FOUND }} — JS files: ${{ env.JS_FILES_COUNT }} — SecretFinder: ${{ env.SECRETFINDER }} — LinkFinder: ${{ env.LINKFINDER }} — DeepSecrets: $(ls findings/deep 2>/dev/null | wc -l)\"}" \
+              -F "file=@${{ env.ZIP_FILE }}" \
+              "${{ env.DISCORD_WEBHOOK }}"
+          else
+            echo "No zip file to upload"
+          fi
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: scan-results
+          name: extended-scan-results
           path: |
             subdomains.txt
+            js_urls.txt
+            js_files
+            findings
+            findings/deep
             nuclei-results.txt
+            collectors
+            ffuf_out
+            artifacts/*.zip
