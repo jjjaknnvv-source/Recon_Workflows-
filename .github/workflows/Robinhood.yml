@@ -6,7 +6,7 @@ on:
       domain:
         description: 'Domain to scan'
         required: true
-        default: 'vueling.com'
+        default: 'robinhood.com'
   schedule:
     - cron: '0 6 * * 1'  # Every Monday at 6 AM UTC
 
